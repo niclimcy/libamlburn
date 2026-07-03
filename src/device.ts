@@ -393,6 +393,16 @@ export class Device {
     command: string,
     options?: { expect?: string; timeout?: number; busyRetryDelay?: number }
   ): Promise<string> {
+    const trimmed = command.trim()
+    const parts = trimmed.split(/\s+/)
+    if (parts[0] === 'printenv') {
+      const vars = parts.slice(1)
+      return this.readEnv({
+        vars,
+        ...(options?.timeout !== undefined ? { timeout: options.timeout } : {})
+      })
+    }
+
     const { expect = 'success', timeout = 3000, busyRetryDelay = BUSY_RETRY_DELAY } = options ?? {}
     await this.bulkCmd(command, { readStatus: false })
 
@@ -409,6 +419,34 @@ export class Device {
       throw new BulkCmdError(command, text)
     }
     return text
+  }
+
+  /**
+   * Read the U-Boot environment as `name=value` lines. The device never sends
+   * command output back over USB (bulk commands are only acked with
+   * success/failed, so `printenv` prints to the device console alone); instead
+   * this exports the env as text into RAM and uploads it back.
+   * @param options.vars limit the export to these variables
+   * @param options.address scratch RAM the env is exported to; the default is
+   * the classic meson kernel load address, unused in burn mode
+   */
+  async readEnv(options?: {
+    vars?: string[]
+    address?: number
+    size?: number
+    timeout?: number
+  }): Promise<string> {
+    const { vars = [], address = 0x1080000, size = 0x2000, timeout } = options ?? {}
+    const hexAddr = `0x${address.toString(16)}`
+    const args = vars.length ? ` ${vars.join(' ')}` : ''
+    await this.checkBulkCmd(`env export -t -s 0x${size.toString(16)} ${hexAddr}${args}`, {
+      ...(timeout !== undefined ? { timeout } : {})
+    })
+    await this.checkBulkCmd(`upload mem ${hexAddr} normal 0x${size.toString(16)}`, {
+      ...(timeout !== undefined ? { timeout } : {})
+    })
+    const data = await this.readMedia(size, timeout)
+    return trimNulls(data).trimEnd()
   }
 
   // ---- media (partition) streaming ----

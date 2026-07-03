@@ -268,6 +268,18 @@ describe('bulk commands', () => {
     await expect(device.checkBulkCmd('low_power')).resolves.toBe('success')
   })
 
+  test('checkBulkCmd redirects printenv to readEnv', async () => {
+    const { device, bulkInQueue, controlInQueue } = createDevice()
+
+    bulkInQueue.push(ascii('success', 512))
+    bulkInQueue.push(ascii('success', 512))
+    controlInQueue.push(new Uint8Array(16))
+    bulkInQueue.push(ascii('bootcmd=run storeboot\nbootdelay=1\n\0\0\0\0', 0x2000))
+
+    const reply = await device.checkBulkCmd('printenv')
+    expect(reply).toBe('bootcmd=run storeboot\nbootdelay=1')
+  })
+
   test('checkBulkCmd polls through Continue:34 busy replies', async () => {
     const { device, bulkInQueue } = createDevice()
     bulkInQueue.push(ascii('Continue:34', 512), ascii('Continue:34', 512), ascii('success', 512))
@@ -298,6 +310,65 @@ describe('bulk commands', () => {
   test('bulkCmd rejects over-long commands', async () => {
     const { device } = createDevice()
     await expect(device.bulkCmd('x'.repeat(127))).rejects.toThrow(AmlUsbError)
+  })
+
+  test('readEnv exports the environment variables, uploads them, and reads them', async () => {
+    const { device, controlsIn, controlsOut, controlInQueue, bulkInQueue } = createDevice()
+
+    bulkInQueue.push(ascii('success', 512))
+    bulkInQueue.push(ascii('success', 512))
+    controlInQueue.push(new Uint8Array(16))
+    bulkInQueue.push(ascii('bootcmd=run storeboot\nbootdelay=1\n\0\0\0\0', 0x2000))
+
+    const envStr = await device.readEnv()
+
+    expect(controlsOut[0]!.request).toBe(Request.BULKCMD)
+    expect([...controlsOut[0]!.data!].slice(-1)).toEqual([0])
+    const exportedCmd = new TextDecoder().decode(
+      controlsOut[0]!.data!.subarray(0, controlsOut[0]!.data!.length - 1)
+    )
+    expect(exportedCmd).toBe('env export -t -s 0x2000 0x1080000')
+
+    expect(controlsOut[1]!.request).toBe(Request.BULKCMD)
+    const uploadCmd = new TextDecoder().decode(
+      controlsOut[1]!.data!.subarray(0, controlsOut[1]!.data!.length - 1)
+    )
+    expect(uploadCmd).toBe('upload mem 0x1080000 normal 0x2000')
+
+    expect(controlsIn[0]).toEqual({
+      request: Request.READ_MEDIA,
+      value: 0x2000,
+      index: 2,
+      length: 16
+    })
+    expect(envStr).toBe('bootcmd=run storeboot\nbootdelay=1')
+  })
+
+  test('readEnv accepts specific variables and custom options', async () => {
+    const { device, controlsOut, controlInQueue, bulkInQueue } = createDevice()
+
+    bulkInQueue.push(ascii('success', 512))
+    bulkInQueue.push(ascii('success', 512))
+    controlInQueue.push(new Uint8Array(16))
+    bulkInQueue.push(ascii('bootcmd=run storeboot\n\0', 0x1000))
+
+    const envStr = await device.readEnv({
+      vars: ['bootcmd', 'bootdelay'],
+      address: 0x2000000,
+      size: 0x1000
+    })
+
+    const exportedCmd = new TextDecoder().decode(
+      controlsOut[0]!.data!.subarray(0, controlsOut[0]!.data!.length - 1)
+    )
+    expect(exportedCmd).toBe('env export -t -s 0x1000 0x2000000 bootcmd bootdelay')
+
+    const uploadCmd = new TextDecoder().decode(
+      controlsOut[1]!.data!.subarray(0, controlsOut[1]!.data!.length - 1)
+    )
+    expect(uploadCmd).toBe('upload mem 0x2000000 normal 0x1000')
+
+    expect(envStr).toBe('bootcmd=run storeboot')
   })
 })
 
