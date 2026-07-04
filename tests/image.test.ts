@@ -159,4 +159,11 @@ describe('AmlImage error handling', () => {
     const truncated = full.subarray(0, full.length - 4)
     await expect(AmlImage.open(truncated)).rejects.toThrow(/overruns the package/)
   })
+
+  test('rejects a 64-bit field beyond MAX_SAFE_INTEGER', async () => {
+    const image = buildImage(2, FIXTURE_ITEMS)
+    // patch the first item's size field (item table starts at 64)
+    new DataView(image.buffer).setBigUint64(64 + 0x18, 1n << 60n, true)
+    await expect(AmlImage.open(image)).rejects.toThrow(/MAX_SAFE_INTEGER/)
+  })
 })

@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import { Request } from '../src/constants'
 import { Device } from '../src/device'
 import { AmlcError, AmlUsbError, BulkCmdError, MediaWriteError, TplCmdError } from '../src/errors'
@@ -20,6 +20,7 @@ function createFakeTransport() {
   const bulkSent: Uint8Array[] = []
   const controlInQueue: Uint8Array<ArrayBuffer>[] = []
   const bulkInQueue: (Uint8Array<ArrayBuffer> | Error)[] = []
+  const disconnectCallbacks: (() => void)[] = []
 
   const transport = {
     connect: () => Promise.resolve(),
@@ -44,10 +45,20 @@ function createFakeTransport() {
       return Promise.resolve(reply)
     },
     close: () => Promise.resolve(),
-    onDisconnect: () => {}
+    onDisconnect: (callback: () => void) => {
+      disconnectCallbacks.push(callback)
+    }
   } satisfies UsbTransport
 
-  return { transport, controlsOut, controlsIn, bulkSent, controlInQueue, bulkInQueue }
+  return {
+    transport,
+    controlsOut,
+    controlsIn,
+    bulkSent,
+    controlInQueue,
+    bulkInQueue,
+    disconnectCallbacks
+  }
 }
 
 function createDevice() {
@@ -128,6 +139,18 @@ describe('memory read/write', () => {
     expect(data[128]).toBe(3)
     expect(controlsIn.map((c) => c.length)).toEqual([64, 64, 2])
     expect(controlsIn.map((c) => c.index)).toEqual([0x1000, 0x1040, 0x1080])
+  })
+
+  test('readSimpleMemory returns empty for a zero-length read', async () => {
+    const { device, controlsIn } = createDevice()
+
+    await expect(device.readSimpleMemory(0x1000, 0)).resolves.toHaveLength(0)
+    expect(controlsIn).toHaveLength(0) // no transfer issued
+  })
+
+  test('readSimpleMemory rejects more than 64 bytes', async () => {
+    const { device } = createDevice()
+    await expect(device.readSimpleMemory(0, 65)).rejects.toThrow(AmlUsbError)
   })
 
   test('readReg decodes little-endian', async () => {
@@ -300,6 +323,25 @@ describe('bulk commands', () => {
     ).resolves.toBe('success')
   })
 
+  test('checkBulkCmd rethrows the last transfer error at the deadline', async () => {
+    const { device } = createDevice()
+
+    // the empty bulk queue rejects every poll; the deadline surfaces the error
+    await expect(device.checkBulkCmd('low_power', { timeout: 30 })).rejects.toThrow(
+      'no bulk reply queued'
+    )
+  })
+
+  test('checkBulkCmd times out with AmlUsbError while the device stays busy', async () => {
+    const { device, bulkInQueue } = createDevice()
+    bulkInQueue.push(ascii('Continue:34', 512), ascii('Continue:34', 512))
+
+    // the second busy reply lands past the deadline with no error captured
+    await expect(
+      device.checkBulkCmd('low_power', { timeout: 20, busyRetryDelay: 30 })
+    ).rejects.toThrow(/timed out/)
+  })
+
   test('checkBulkCmd throws BulkCmdError on an unexpected response', async () => {
     const { device, bulkInQueue } = createDevice()
     bulkInQueue.push(ascii('failed:no space', 512))
@@ -450,6 +492,29 @@ describe('media writes', () => {
     expect(new DataView(controlsOut[1]!.data!.buffer).getUint32(0, true)).toBe(1)
   })
 
+  test('writeMediaStream logs a failed block write and resends it', async () => {
+    const fake = createFakeTransport()
+    const logger = vi.fn()
+    const device = new Device(fake.transport, { timeout: 100, logging: true, logger })
+
+    const bulkOut = fake.transport.bulkOut
+    let failed = false
+    fake.transport.bulkOut = (data) => {
+      if (!failed) {
+        failed = true
+        return Promise.reject(new Error('pipe stall'))
+      }
+      return bulkOut(data)
+    }
+    fake.bulkInQueue.push(ascii('OK!!', 0x200))
+
+    await device.writeMediaStream(new Uint8Array(64), { resendDelay: 0 })
+
+    expect(logger).toHaveBeenCalledWith('debug', expect.any(Error))
+    // the resent attempt carries retryTimes=1 in its header
+    expect(new DataView(fake.controlsOut[1]!.data!.buffer).getUint32(0, true)).toBe(1)
+  })
+
   test('readMedia issues the setup control read then bulk-reads the payload', async () => {
     const { device, controlsIn, controlInQueue, bulkInQueue } = createDevice()
     controlInQueue.push(new Uint8Array(16))
@@ -579,6 +644,59 @@ describe('AMLC', () => {
   })
 })
 
+describe('logging', () => {
+  test('falls back to the console when no logger is set', () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      const { device } = createDevice()
+      device._log('info', 'hello')
+      device._log('debug', 'dropped') // logging disabled: debug is gated off
+      expect(info).toHaveBeenCalledWith('hello')
+      expect(log).not.toHaveBeenCalled()
+
+      const fake = createFakeTransport()
+      new Device(fake.transport, { timeout: 100, logging: true })._log('debug', 'shown')
+      expect(log).toHaveBeenCalledWith('shown')
+    } finally {
+      info.mockRestore()
+      log.mockRestore()
+    }
+  })
+
+  test('routes to the provided logger', () => {
+    const logger = vi.fn()
+    const fake = createFakeTransport()
+    const device = new Device(fake.transport, { timeout: 100, logging: true, logger })
+
+    device._log('debug', 'payload', 42)
+
+    expect(logger).toHaveBeenCalledWith('debug', 'payload', 42)
+  })
+})
+
+describe('connection lifecycle', () => {
+  test('initialize wraps a connect failure in AmlUsbError with the cause', async () => {
+    const fake = createFakeTransport()
+    fake.transport.connect = () => Promise.reject(new Error('boom'))
+    const device = new Device(fake.transport, { timeout: 100 })
+
+    const error: unknown = await device.initialize().catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(AmlUsbError)
+    expect(((error as AmlUsbError).cause as Error).message).toBe('boom')
+  })
+
+  test('onDisconnect forwards the callback to the transport', () => {
+    const { device, disconnectCallbacks } = createDevice()
+    const callback = () => {}
+
+    device.onDisconnect(callback)
+
+    expect(disconnectCallbacks).toEqual([callback])
+  })
+})
+
 describe('misc primitives', () => {
   test('nop issues a data-less control transfer', async () => {
     const { device, controlsOut } = createDevice()
@@ -601,5 +719,29 @@ describe('misc primitives', () => {
     const usbDevice = { controlTransferIn: () => {} } as unknown as USBDevice
     const device = new Device(usbDevice)
     expect(device.usbDevice).toBe(usbDevice)
+  })
+})
+
+describe('waitForIdentify', () => {
+  test('polls until identify succeeds', async () => {
+    const { device, controlInQueue } = createDevice()
+
+    // the first poll finds nothing queued and retries after its 200 ms pause
+    const pending = device.waitForIdentify(2000)
+    controlInQueue.push(new Uint8Array([0, 9, 0, 16, 0, 0, 0, 0]))
+
+    await expect(pending).resolves.toHaveProperty('stageName', 'TPL')
+  })
+
+  test('rejects after the timeout and stops polling', async () => {
+    const { device, controlsIn } = createDevice()
+
+    await expect(device.waitForIdentify(20)).rejects.toThrow(
+      /timed out waiting for the device to identify/
+    )
+
+    // the abandoned loop makes at most one more attempt, then stops
+    await new Promise((resolve) => setTimeout(resolve, 450))
+    expect(controlsIn.length).toBeLessThanOrEqual(2)
   })
 })

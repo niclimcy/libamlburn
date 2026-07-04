@@ -2,7 +2,7 @@ import { openAsBlob } from 'node:fs'
 import { describe, expect, test, vi } from 'vitest'
 import { Request } from '../../src/constants'
 import { Device } from '../../src/device'
-import { AmlImageError, PasswordError } from '../../src/errors'
+import { AmlImageError, BulkCmdError, PasswordError } from '../../src/errors'
 import { trimNulls } from '../../src/headers'
 import { AmlImage } from '../../src/image'
 import { BurnProgress, BurnTimings, flashImage, WipeMode } from '../../src/optimus'
@@ -47,6 +47,8 @@ function createBurnTransport(script: {
   bulkReplies?: (string | Uint8Array<ArrayBuffer>)[]
   tplReplies?: string[]
   readMemReplies?: Uint8Array<ArrayBuffer>[]
+  /** commands whose control transfer fails (device dropped off the bus) */
+  failControlCommands?: string[]
 }) {
   const identifies = script.identifies.map((bytes) => new Uint8Array(bytes))
   const bulkQueue = (script.bulkReplies ?? []).map((reply) =>
@@ -64,7 +66,11 @@ function createBurnTransport(script: {
     controlOut: (request: number, value: number, index: number, data?: Uint8Array<ArrayBuffer>) => {
       controlsOut.push({ request, value, index, ...(data ? { data: data.slice() } : {}) })
       if ((request === Request.BULKCMD || request === Request.TPL_CMD) && data) {
-        commands.push(trimNulls(data))
+        const command = trimNulls(data)
+        commands.push(command)
+        if (script.failControlCommands?.includes(command)) {
+          return Promise.reject(new Error('device dropped off the bus'))
+        }
       }
       return Promise.resolve(data?.length ?? 0)
     },
@@ -112,20 +118,48 @@ function amlcRequest(length: number, offset: number): Uint8Array<ArrayBuffer> {
   return block
 }
 
+/** A 512-byte BL2 para block as read back by checkPara */
+function paraBlock(magic = 0x7856efab): Uint8Array<ArrayBuffer> {
+  const block = new Uint8Array(512)
+  new DataView(block.buffer).setUint32(0, magic, true)
+  return block
+}
+
+/** The 8 x 64-byte bulk replies of the 0x200 chip-id read at IPL */
+function chipIdBlocks(chipId: number): Uint8Array<ArrayBuffer>[] {
+  const blocks = Array.from({ length: 8 }, () => new Uint8Array(64))
+  new DataView(blocks[0]!.buffer).setUint32(0, chipId, true)
+  return blocks
+}
+
 const IPL = [2, 2, 0, 0, 0, 0, 0, 0]
 const SPL_AMLC = [2, 2, 1, 8, 0, 0, 0, 0]
 const TPL = [0, 9, 0, 16, 0, 0, 0, 0]
 
-async function openFixtureImage(extraItems: FixtureItem[] = []) {
+async function openFixtureImage(extraItems: FixtureItem[] = [], conf = PLATFORM_CONF) {
   return AmlImage.open(
     buildImage(2, [
-      { mainType: 'conf', subType: 'platform', payload: asciiBytes(PLATFORM_CONF) },
+      { mainType: 'conf', subType: 'platform', payload: asciiBytes(conf) },
       { mainType: 'USB', subType: 'DDR', payload: new Uint8Array(64).fill(0xdd) },
       { mainType: 'USB', subType: 'UBOOT', payload: new Uint8Array(0x400).fill(0xbb) },
       ...extraItems
     ])
   )
 }
+
+/** AXG/GXL-style platform: a para block address instead of the AMLC flow */
+const PARA_CONF = `
+Platform:0x0811
+DDRLoad:0xd9000000
+DDRRun:0xd9000000
+UbootLoad:0x200c000
+UbootRun:0xd9010000
+bl2ParaAddr=0xd9013800
+Control0=0xc110419c:0xb1
+Control1=0xc1104174:0x5183
+Encrypt_reg:0xc8100228
+DDRSize:0
+`
 
 describe('flashImage from TPL (device already in U-Boot)', () => {
   test('runs the full command sequence', async () => {
@@ -397,5 +431,423 @@ describe('flashImage input validation', () => {
         noEraseBootloader: true
       })
     ).rejects.toThrow(/UBOOT item/)
+  })
+})
+
+describe('flashImage erase-bootloader paths', () => {
+  test('erases an old bootloader, tolerates the dropped reset reply, and reacquires', async () => {
+    const image = await openFixtureImage()
+
+    const oldFake = createBurnTransport({
+      identifies: [TPL],
+      bulkReplies: [
+        'success', // low_power
+        'success', // bootloader_is_old -> it is old
+        'success' //  erase_bootloader
+      ],
+      failControlCommands: ['reset'] // device drops off the bus mid-reset
+    })
+    const newFake = createBurnTransport({
+      identifies: [TPL],
+      bulkReplies: [
+        'success', //     upload mem (secure check)
+        new Uint8Array([0, 0, 0, 0]), // encrypt reg value -> not secure
+        'success', //     low_power
+        'success', //     disk_initial
+        'success', //     save_setting
+        'success' //      burn_complete
+      ]
+    })
+
+    const oldDevice = new Device(oldFake.transport, { timeout: 100 })
+    const newDevice = new Device(newFake.transport, { timeout: 100 })
+    const reacquire = vi.fn().mockResolvedValue(newDevice)
+
+    const result = await flashImage(oldDevice, image, { timings: ZERO_TIMINGS, reacquire })
+
+    expect(reacquire).toHaveBeenCalledTimes(1)
+    expect(result).toBe(newDevice)
+    expect(oldFake.commands).toEqual([
+      '    echo 1234',
+      '    low_power',
+      'bootloader_is_old',
+      'erase_bootloader',
+      'reset'
+    ])
+    expect(newFake.commands).toEqual([
+      'upload mem 0xc8100228 normal 0x4',
+      '    low_power',
+      'disk_initial 0',
+      'save_setting',
+      'burn_complete 3'
+    ])
+  })
+
+  test('throws when the device refuses the reset', async () => {
+    const image = await openFixtureImage()
+    const fake = createBurnTransport({
+      identifies: [TPL],
+      bulkReplies: ['success', 'success', 'success', 'failed'] // reset refused
+    })
+
+    await expect(
+      flashImage(new Device(fake.transport, { timeout: 100 }), image, { timings: ZERO_TIMINGS })
+    ).rejects.toThrow(BulkCmdError)
+  })
+
+  test('rethrows a transfer error from the old-bootloader probe', async () => {
+    const image = await openFixtureImage()
+    const fake = createBurnTransport({
+      identifies: [TPL],
+      bulkReplies: ['success'], // low_power
+      failControlCommands: ['bootloader_is_old']
+    })
+
+    await expect(
+      flashImage(new Device(fake.transport, { timeout: 100 }), image, { timings: ZERO_TIMINGS })
+    ).rejects.toThrow('device dropped off the bus')
+  })
+
+  test('throws on an invalid power state', async () => {
+    const image = await openFixtureImage()
+    const fake = createBurnTransport({
+      identifies: [[2, 2, 0, 4, 0, 0, 0, 0]] // neither IPL nor TPL
+    })
+
+    await expect(
+      flashImage(new Device(fake.transport, { timeout: 100 }), image, { timings: ZERO_TIMINGS })
+    ).rejects.toThrow(/invalid power state/)
+  })
+
+  test('falls back to reacquireDevice when no reacquire callback is given', async () => {
+    const image = await openFixtureImage()
+    const fake = createBurnTransport({
+      identifies: [TPL],
+      bulkReplies: ['success', 'success', 'success', 'success'] // reset succeeds
+    })
+
+    // Node has no navigator.usb, so the default reacquireDevice throws
+    await expect(
+      flashImage(new Device(fake.transport, { timeout: 100 }), image, { timings: ZERO_TIMINGS })
+    ).rejects.toThrow(/WebUSB is unavailable/)
+  })
+})
+
+describe('flashImage secure-boot detection at IPL', () => {
+  const conf = (lines: string) => `Platform:0x0811\nDDRLoad:0xd9000000\nDDRRun:0xd9000000\n${lines}`
+
+  test('throws on an invalid encrypt register', async () => {
+    const image = await openFixtureImage([], conf('Encrypt_reg:0xffffffff'))
+    const fake = createBurnTransport({ identifies: [IPL] })
+
+    await expect(
+      flashImage(new Device(fake.transport, { timeout: 100 }), image, {
+        timings: ZERO_TIMINGS,
+        noEraseBootloader: true
+      })
+    ).rejects.toThrow(/invalid encrypt register/)
+  })
+
+  test('looks the encrypt register up by chip id', async () => {
+    const image = await openFixtureImage(
+      [],
+      conf('Encrypt_reg:0\nEncrypt_reg1=0xc8100228\nenc_chip_id1:0x1234')
+    )
+    const fake = createBurnTransport({
+      identifies: [IPL, IPL, TPL], // TPL after the check: skip SPL/U-Boot stages
+      bulkReplies: [...chipIdBlocks(0x1234), 'success', 'success', 'success', 'success'],
+      readMemReplies: [new Uint8Array([0, 0, 0, 0])] // encrypt reg -> not secure
+    })
+
+    const device = new Device(fake.transport, { timeout: 100 })
+    await expect(
+      flashImage(device, image, { timings: ZERO_TIMINGS, noEraseBootloader: true })
+    ).resolves.toBe(device)
+
+    const chipIdRead = fake.controlsOut.find((c) => c.request === Request.RD_LARGE_MEM)!
+    expect(new DataView(chipIdRead.data!.buffer).getUint32(0, true)).toBe(0xd9040004)
+    expect(fake.commands).toEqual([
+      '    low_power',
+      'disk_initial 0',
+      'save_setting',
+      'burn_complete 3'
+    ])
+  })
+
+  test('matches the second chip id and rejects an unsupported SPL platform', async () => {
+    const image = await openFixtureImage(
+      [],
+      `Platform:0x9999\nDDRLoad:0xd9000000\nDDRRun:0xd9000000\n` +
+        'Encrypt_reg:0\nEncrypt_reg2=0xc8100228\nenc_chip_id1:0x1111\nenc_chip_id2:0x1234'
+    )
+    const fake = createBurnTransport({
+      identifies: [IPL],
+      bulkReplies: chipIdBlocks(0x1234),
+      readMemReplies: [new Uint8Array([0, 0, 0, 0])]
+    })
+
+    await expect(
+      flashImage(new Device(fake.transport, { timeout: 100 }), image, {
+        timings: ZERO_TIMINGS,
+        noEraseBootloader: true
+      })
+    ).rejects.toThrow(/platform 0x9999 not supported/)
+  })
+
+  test('throws when the chip id matches no configured register', async () => {
+    const image = await openFixtureImage(
+      [],
+      conf('Encrypt_reg:0\nEncrypt_reg1=0xc8100228\nenc_chip_id1:0x1111\nenc_chip_id2:0x2222')
+    )
+    const fake = createBurnTransport({
+      identifies: [IPL],
+      bulkReplies: chipIdBlocks(0x1234) // matches neither chip id
+    })
+
+    await expect(
+      flashImage(new Device(fake.transport, { timeout: 100 }), image, {
+        timings: ZERO_TIMINGS,
+        noEraseBootloader: true
+      })
+    ).rejects.toThrow(/cannot determine the encrypt register/)
+  })
+})
+
+describe('flashImage AXG/GXL para-block path', () => {
+  test('pushes U-Boot with large-memory writes and para blocks', async () => {
+    const image = await openFixtureImage(
+      [{ mainType: 'PARTITION', subType: 'boot', payload: new Uint8Array(8).fill(1) }],
+      PARA_CONF
+    )
+
+    const romFake = createBurnTransport({
+      identifies: [
+        IPL, //           checkPassword
+        IPL, //           isSecureBoot
+        IPL, //           downloadSPL entry
+        [0, 9, 0, 0], //  runInAddress(DDRRun): version 0.9 -> keep-power flag
+        [2, 2, 0, 8], //  after SPL: BL2 up without AMLC -> run at bl2ParaAddr
+        [0, 5, 0, 0], //  runInAddress(bl2ParaAddr): version 0.5 -> no flag
+        IPL, //           downloadUboot entry -> large-memory push path
+        IPL, //           re-identify after the U-Boot push -> DDR reload
+        IPL, //           updateDdr -> runUboot at UbootRun
+        IPL, //           runInAddress(UbootRun) version check
+        IPL, //           updateDdr post-checkPara -> DDR reload again
+        [2, 2, 0, 8] //   final runUboot -> run at bl2ParaAddr (repeats)
+      ],
+      readMemReplies: [new Uint8Array([0, 0, 0, 0])], // encrypt reg -> not secure
+      bulkReplies: [paraBlock(), paraBlock()] // both checkPara read-backs
+    })
+    const tplFake = createBurnTransport({
+      identifies: [TPL],
+      bulkReplies: [
+        'success', //     low_power
+        'success', //     disk_initial
+        asciiBytes('OK!!', 0x200), // boot media ack
+        'success', //     download get_status
+        'success', //     save_setting
+        'success' //      burn_complete
+      ]
+    })
+
+    const romDevice = new Device(romFake.transport, { timeout: 100 })
+    const tplDevice = new Device(tplFake.transport, { timeout: 100 })
+    const reacquire = vi.fn().mockResolvedValue(tplDevice)
+
+    const result = await flashImage(romDevice, image, {
+      timings: ZERO_TIMINGS,
+      reacquire,
+      noEraseBootloader: true
+    })
+
+    expect(reacquire).toHaveBeenCalledTimes(1)
+    expect(result).toBe(tplDevice)
+
+    // DDR x3, U-Boot, and three para blocks pushed over large-memory writes
+    const writes = romFake.controlsOut
+      .filter((c) => c.request === Request.WR_LARGE_MEM)
+      .map((c) => {
+        const view = new DataView(c.data!.buffer)
+        return [view.getUint32(0, true), view.getUint32(4, true)]
+      })
+    expect(writes).toEqual([
+      [0xd9000000, 64], //   DDR image
+      [0xd9013800, 24], //   SPL para block
+      [0x200c000, 0x400], // U-Boot image
+      [0xd9000000, 64], //   DDR reload after the U-Boot push
+      [0xd9013800, 100], //  updateDdr para block
+      [0xd9000000, 64], //   DDR reload after updateDdr
+      [0xd9013800, 36] //    final para block
+    ])
+    expect(romFake.bulkSent.map((b) => b.length)).toEqual([64, 24, 0x400, 64, 100, 64, 36])
+
+    // both checkPara read-backs targeted the para address
+    const reads = romFake.controlsOut
+      .filter((c) => c.request === Request.RD_LARGE_MEM)
+      .map((c) => new DataView(c.data!.buffer).getUint32(0, true))
+    expect(reads).toEqual([0xd9013800, 0xd9013800])
+
+    // run sequence: DDR init (flag), BL2 para (no flag: version 0.5), U-Boot, BL2 para
+    const runs = romFake.controlsOut
+      .filter((c) => c.request === Request.RUN_IN_ADDR)
+      .map((c) => new DataView(c.data!.buffer).getUint32(0, true))
+    expect(runs).toEqual([0xd9000010, 0xd9013800, 0xd9010010, 0xd9013810])
+
+    expect(tplFake.commands).toEqual([
+      '    low_power',
+      'disk_initial 0',
+      'download store boot normal 8',
+      'download get_status',
+      'save_setting',
+      'burn_complete 3'
+    ])
+  })
+
+  test('throws when the para block does not read back', async () => {
+    const image = await openFixtureImage([], PARA_CONF)
+    const fake = createBurnTransport({
+      identifies: [IPL, IPL, IPL, [0, 9, 0, 0], IPL], // back at IPL after DDR init
+      readMemReplies: [new Uint8Array([0, 0, 0, 0])],
+      bulkReplies: [new Uint8Array(0x200)] // zero magic
+    })
+
+    await expect(
+      flashImage(new Device(fake.transport, { timeout: 100 }), image, {
+        timings: ZERO_TIMINGS,
+        noEraseBootloader: true
+      })
+    ).rejects.toThrow(/failed to read back para block: 0x0/)
+  })
+
+  test('throws on an unexpected stage after SPL', async () => {
+    const image = await openFixtureImage()
+    const fake = createBurnTransport({
+      identifies: [IPL, IPL, IPL, [0, 9, 0, 0], [9, 9, 9, 9]],
+      readMemReplies: [new Uint8Array([0, 0, 0, 0])]
+    })
+
+    await expect(
+      flashImage(new Device(fake.transport, { timeout: 100 }), image, {
+        timings: ZERO_TIMINGS,
+        noEraseBootloader: true
+      })
+    ).rejects.toThrow(/unexpected stage after SPL/)
+  })
+
+  test('throws on an unexpected stage entering the SPL download', async () => {
+    const image = await openFixtureImage()
+    const fake = createBurnTransport({
+      identifies: [IPL, IPL, [2, 2, 0, 4, 0, 0, 0, 0]],
+      readMemReplies: [new Uint8Array([0, 0, 0, 0])]
+    })
+
+    await expect(
+      flashImage(new Device(fake.transport, { timeout: 100 }), image, {
+        timings: ZERO_TIMINGS,
+        noEraseBootloader: true
+      })
+    ).rejects.toThrow(/unexpected stage:/)
+  })
+
+  test('throws on an unexpected stage before U-Boot', async () => {
+    const image = await openFixtureImage()
+    const fake = createBurnTransport({
+      identifies: [SPL_AMLC, SPL_AMLC, SPL_AMLC, [2, 2, 0, 4, 0, 0, 0, 0]]
+    })
+
+    await expect(
+      flashImage(new Device(fake.transport, { timeout: 100 }), image, {
+        timings: ZERO_TIMINGS,
+        noEraseBootloader: true
+      })
+    ).rejects.toThrow(/unexpected stage before U-Boot/)
+  })
+
+  test('throws on a short read while streaming the DDR image', async () => {
+    const image = await openFixtureImage()
+    const ddr = image.itemGet('USB', 'DDR')!
+    vi.spyOn(ddr, 'read')
+      .mockResolvedValueOnce(new Uint8Array(32))
+      .mockResolvedValue(new Uint8Array())
+
+    const fake = createBurnTransport({
+      identifies: [IPL],
+      readMemReplies: [new Uint8Array([0, 0, 0, 0])]
+    })
+
+    const rejection = expect(
+      flashImage(new Device(fake.transport, { timeout: 100 }), image, {
+        timings: ZERO_TIMINGS,
+        noEraseBootloader: true
+      })
+    ).rejects
+    await rejection.toThrow(AmlImageError)
+    await rejection.toThrow(/short read streaming DDR: 32 < 64/)
+  })
+})
+
+describe('flashImage secure TPL flow', () => {
+  test('swaps the dtb for meson1_ENC and tolerates a lost burn_complete reply', async () => {
+    const image = await openFixtureImage([
+      // downloadUboot resolves the (secure) boot item before its TPL early return
+      { mainType: 'USB', subType: 'UBOOT_ENC', payload: new Uint8Array(64).fill(0xcc) },
+      { mainType: 'dtb', subType: 'meson1', payload: new Uint8Array(24).fill(0x11) },
+      { mainType: 'dtb', subType: 'meson1_ENC', payload: new Uint8Array(16).fill(0x22) }
+    ])
+
+    const fake = createBurnTransport({
+      identifies: [TPL],
+      bulkReplies: [
+        'success', //     low_power (erase-bootloader step)
+        'failed', //      bootloader_is_old -> "new", skip erase
+        'success', //     upload mem (secure check)
+        new Uint8Array([0x10, 0, 0, 0]), // encrypt reg value -> secure boot
+        'success', //     low_power
+        'success', //     disk_initial
+        asciiBytes('OK!!', 0x200), // dtb media ack
+        'success', //     download get_status
+        'success' //      save_setting
+      ],
+      failControlCommands: ['burn_complete 3'] // reply lost mid-poweroff (swallowed)
+    })
+
+    const device = new Device(fake.transport, { timeout: 100 })
+    await expect(flashImage(device, image, { timings: ZERO_TIMINGS })).resolves.toBe(device)
+
+    expect(fake.commands).toEqual([
+      '    echo 1234',
+      '    low_power',
+      'bootloader_is_old',
+      'upload mem 0xc8100228 normal 0x4',
+      '    low_power',
+      'disk_initial 0',
+      'download mem dtb normal 16', // the 16-byte ENC item, not the 24-byte plain one
+      'download get_status',
+      'save_setting',
+      'burn_complete 3'
+    ])
+    expect(fake.bulkSent.filter((b) => b.length === 16 && b[0] === 0x22)).toHaveLength(1)
+    expect(fake.bulkSent.some((b) => b[0] === 0x11)).toBe(false)
+  })
+
+  test('throws when the device explicitly refuses burn_complete', async () => {
+    const image = await openFixtureImage()
+    const fake = createBurnTransport({
+      identifies: [TPL],
+      bulkReplies: [
+        'success', //     low_power (erase-bootloader step)
+        'failed', //      bootloader_is_old -> "new", skip erase
+        'success', //     upload mem (secure check)
+        new Uint8Array([0, 0, 0, 0]), // encrypt reg value -> not secure
+        'success', //     low_power
+        'success', //     disk_initial
+        'success', //     save_setting
+        'failed' //       burn_complete refused
+      ]
+    })
+
+    await expect(
+      flashImage(new Device(fake.transport, { timeout: 100 }), image, { timings: ZERO_TIMINGS })
+    ).rejects.toThrow(BulkCmdError)
   })
 })

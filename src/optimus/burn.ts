@@ -543,7 +543,9 @@ export async function flashImage(
   try {
     await checkCmd(ctx, `burn_complete ${options.reboot ? 1 : 3}`)
   } catch (error) {
-    // the device usually disconnects before the reply arrives
+    // reboot (1) drops off the bus before replying, but poweroff-after-
+    // disconnect (3) replies first: an explicit failure reply means refused
+    if (error instanceof BulkCmdError) throw error
     ctx.device._log('debug', 'burn_complete reply not received', error)
   }
 

@@ -648,15 +648,23 @@ export class Device {
 
   /** Wait until the device answers identify(), or reject after `timeout` ms */
   async waitForIdentify(timeout = 10_000): Promise<DeviceInfo> {
+    let expired = false
     const poll = async (): Promise<DeviceInfo> => {
       for (;;) {
         try {
           return await this.identify()
-        } catch {
-          await delay(200)
+        } catch (error) {
+          if (expired) throw error
         }
+        await delay(200)
       }
     }
-    return timeoutPromise(poll(), 'timed out waiting for the device to identify', timeout)
+    const pending = poll()
+    try {
+      return await timeoutPromise(pending, 'timed out waiting for the device to identify', timeout)
+    } finally {
+      expired = true
+      pending.catch(() => {}) // the abandoned poll's final rejection is expected
+    }
   }
 }
