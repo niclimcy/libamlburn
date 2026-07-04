@@ -3,6 +3,7 @@ import {
   AmlImage,
   flashImage,
   reacquireDevice,
+  ReacquireNeededError,
   requestDevice,
   WipeMode,
   type BurnProgress,
@@ -102,17 +103,19 @@ async function stageImageFile(event: Event) {
 }
 
 /**
- * The device re-enumerates mid-flash, and U-Boot's gadget has no serial
- * number, so the browser usually forgets the WebUSB grant: try silently first,
- * then ask the user to re-pick the device (requestDevice needs a click).
+ * The device re-enumerates mid-flash, and its gadget has no serial number, so
+ * the browser drops the WebUSB grant (spec behavior): reacquireDevice throws
+ * ReacquireNeededError and the user has to re-pick the device (requestDevice
+ * needs a click). Anything else means the device is actually gone.
  */
 async function reacquire(): Promise<Device> {
   try {
-    return await reacquireDevice(3000, {
+    return await reacquireDevice(5000, {
       logging: verboseLogging.value,
       timeout: defaultTimeout.value
     })
-  } catch {
+  } catch (error) {
+    if (!(error instanceof ReacquireNeededError)) throw error
     reconnectNeeded.value = true
     try {
       return await new Promise<Device>((resolve) => {

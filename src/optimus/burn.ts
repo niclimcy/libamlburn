@@ -1,6 +1,12 @@
 import { PRODUCT_GX_CHIP, VENDOR_AMLOGIC } from '../constants'
 import { Device, DeviceOptions } from '../device'
-import { AmlImageError, AmlUsbError, BulkCmdError, PasswordError } from '../errors'
+import {
+  AmlImageError,
+  AmlUsbError,
+  BulkCmdError,
+  PasswordError,
+  ReacquireNeededError
+} from '../errors'
 import { AmlImage, AmlImageItem } from '../image'
 import { DeviceInfo } from '../info'
 import { packUint32sLE, readUint32LE } from '../utils/bytes'
@@ -82,7 +88,13 @@ export type FlashOptions = {
   /** skip the old-bootloader erase step */
   noEraseBootloader?: boolean
   onProgress?: (progress: BurnProgress) => void
-  /** reopen the device after it re-enumerates; defaults to polling navigator.usb.getDevices() */
+  /**
+   * Reopen the device after it re-enumerates mid-flash. Effectively required
+   * for browser apps: the default (reacquireDevice) polls
+   * navigator.usb.getDevices(), but browsers drop the WebUSB grant of
+   * serial-less devices on disconnect, so it throws ReacquireNeededError —
+   * catch it and prompt the user with requestDevice() (needs a user gesture).
+   */
   reacquire?: () => Promise<Device>
   timings?: Partial<BurnTimings>
 }
@@ -431,10 +443,15 @@ async function closeQuietly(device: Device) {
 
 /**
  * Poll `navigator.usb.getDevices()` until the re-enumerated device answers
- * identify(). U-Boot's burn-mode gadget reports the same 1b8e:c003 IDs as the
- * BootROM but carries no serial number, so browsers may not persist the WebUSB
- * grant across the re-enumeration — when this times out, prompt the user again
- * with requestDevice() (which needs a user gesture) and pass the result on.
+ * identify(). This only succeeds when the browser kept the WebUSB grant across
+ * the re-enumeration — a policy grant, or a gadget with a serial number. The
+ * WebUSB spec drops the grant of a serial-less device on disconnect, and
+ * Amlogic burn-mode gadgets report no serial, so browser apps should expect
+ * {@link ReacquireNeededError} and recover by prompting with requestDevice()
+ * (which needs a user gesture).
+ * @throws ReacquireNeededError when no granted candidate ever appeared (the
+ * grant was dropped); a plain timeout error when one appeared but never
+ * answered identify()
  */
 export async function reacquireDevice(
   timeout = 10_000,
@@ -445,12 +462,14 @@ export async function reacquireDevice(
   }
 
   const start = Date.now()
+  let seen = false
   while (Date.now() - start < timeout) {
     const devices = await navigator.usb.getDevices()
     const usbDevice = devices.find(
       (d) => d.vendorId === VENDOR_AMLOGIC && d.productId === PRODUCT_GX_CHIP
     )
     if (usbDevice) {
+      seen = true
       const device = new Device(usbDevice, options)
       try {
         await device.initialize()
@@ -462,6 +481,7 @@ export async function reacquireDevice(
     }
     await delay(200)
   }
+  if (!seen) throw new ReacquireNeededError()
   throw new AmlUsbError('timed out waiting for the device to re-enumerate')
 }
 

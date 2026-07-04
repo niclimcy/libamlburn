@@ -8,6 +8,7 @@ export {
   CommandError,
   MediaWriteError,
   PasswordError,
+  ReacquireNeededError,
   TplCmdError
 } from './errors'
 export { requestDevice } from './requestDevice'

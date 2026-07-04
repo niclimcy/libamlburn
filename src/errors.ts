@@ -36,6 +36,21 @@ export class MediaWriteError extends AmlUsbError {
   }
 }
 
+/**
+ * The device re-enumerated and the browser dropped its WebUSB grant — spec
+ * behavior for devices without a serial number, which Amlogic's burn-mode
+ * gadgets lack. Recover by prompting the user with requestDevice() (requires
+ * a user gesture) and passing the result back via FlashOptions.reacquire.
+ */
+export class ReacquireNeededError extends AmlUsbError {
+  constructor() {
+    super(
+      'the WebUSB grant was dropped on re-enumeration (serial-less device); ' +
+        'prompt the user with requestDevice() to reacquire it'
+    )
+  }
+}
+
 export class AmlcError extends AmlUsbError {}
 
 export class PasswordError extends AmlUsbError {}
