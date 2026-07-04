@@ -24,6 +24,7 @@ const commandInput = ref('')
 const commandLog = ref<string[]>([])
 
 const imageFile = ref<File>()
+const imageInput = ref<HTMLInputElement>()
 const image = ref<AmlImage>()
 const wipe = ref<WipeMode>(WipeMode.None)
 const rebootAfter = ref(true)
@@ -54,12 +55,23 @@ async function setupDevice(device: Device) {
   watchDisconnect(device)
 }
 
+function clearStagedImage() {
+  imageFile.value = undefined
+  image.value = undefined
+  burnProgress.value = undefined
+  flashError.value = ''
+  if (imageInput.value) imageInput.value.value = ''
+}
+
 function watchDisconnect(device: Device) {
   device.onDisconnect(() => {
     // the device re-enumerates mid-flash; flashImage reacquires it itself
     if (!flashing.value) {
       connectedDevice.value = undefined
       deviceInfo.value = undefined
+      // the next device plugged in may be a different board; don't leave the
+      // previous package staged for a one-click flash of the wrong image
+      clearStagedImage()
     }
   })
 }
@@ -225,7 +237,7 @@ async function flash() {
     <fieldset class="flash">
       <legend>Flash an upgrade package</legend>
       <div class="flash-controls">
-        <input type="file" accept=".img" @change="stageImageFile" />
+        <input ref="imageInput" type="file" accept=".img" @change="stageImageFile" />
         <label>
           Wipe:
           <select v-model.number="wipe">
